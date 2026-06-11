@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "CoRead - AI共读",
+  "version": "0.1.0",
+  "description": "微信读书私密标注 + 正文足迹捕获，配合 CoRead 共读 agent 使用",
+  "permissions": ["storage", "scripting", "sidePanel"],
+  "side_panel": {
+    "default_path": "sidebar.html"
+  },
+  "host_permissions": [
+    "https://weread.qq.com/*",
+    "https://*.weread.qq.com/*",
+    "http://localhost:7239/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://weread.qq.com/*"],
+      "js": ["page_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://weread.qq.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_end",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "CoRead"
+  }
+}

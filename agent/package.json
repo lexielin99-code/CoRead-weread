@@ -1,0 +1,11 @@
+{
+  "name": "coread-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CoRead 共读 agent — 自包含交互式会话，调用 Gemini 与用户实时讨论标注",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env index.js",
+    "coldstart": "node --env-file-if-exists=.env scripts/coldstart.js"
+  }
+}

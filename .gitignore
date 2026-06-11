@@ -1,0 +1,26 @@
+# API 密钥（绝对不能上传）
+agent/.env
+
+# 个人阅读数据（隐私）
+agent/profile.md
+agent/soul.md
+
+# 运行时消息队列和书库（个人数据）
+receiver/inbox/*
+!receiver/inbox/.gitkeep
+receiver/books/*
+!receiver/books/.gitkeep
+
+# Agent 标记文件
+agent/.coldstart_skipped
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

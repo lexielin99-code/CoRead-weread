@@ -1,0 +1,10 @@
+{
+  "name": "coread-receiver",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CoRead 本地接收端 — 接收 Chrome 扩展上报的标注和正文",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
