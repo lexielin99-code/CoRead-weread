@@ -77,7 +77,7 @@ Agent  agent/index.js
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/lexielin99-code/coread.git
+git clone https://github.com/lexielin99-code/CoRead-weread.git
 cd coread
 ```
 
