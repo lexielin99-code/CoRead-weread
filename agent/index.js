@@ -132,9 +132,12 @@ async function callLLM() {
   })
   const data = await resp.json()
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error))
-  const text = data.choices?.[0]?.message?.content
+  const msg = data.choices?.[0]?.message
+  const text = msg?.content || msg?.reasoning_content
   if (!text) throw new Error('模型无回应：' + JSON.stringify(data).slice(0, 200))
-  return text.trim()
+  // 剥掉模型可能输出的代码块（不该出现，但兜底）
+  const stripped = text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
+  return stripped
 }
 
 async function say(userText) {
