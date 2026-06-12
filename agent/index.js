@@ -62,7 +62,7 @@ function buildSystemInstruction() {
 
 // ── 侧栏聊天 I/O ─────────────────────────────────────────────────────────────
 function appendChatOutput(role, content) {
-  try { fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({ role, content, timestamp: Date.now() }) + '\n') } catch {}
+  try { fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({ role, content: stripCodeBlocks(content), timestamp: Date.now() }) + '\n') } catch {}
 }
 
 function readChatInputs() {
@@ -135,9 +135,11 @@ async function callLLM() {
   const msg = data.choices?.[0]?.message
   const text = msg?.content || msg?.reasoning_content
   if (!text) throw new Error('模型无回应：' + JSON.stringify(data).slice(0, 200))
-  // 剥掉模型可能输出的代码块（不该出现，但兜底）
-  const stripped = text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
-  return stripped
+  return text.trim()
+}
+
+function stripCodeBlocks(text) {
+  return text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
 }
 
 async function say(userText) {
@@ -200,17 +202,23 @@ ${currentProfile}
 ${currentSoul}`
 
   const resp = await say(prompt)
+  console.log('[debug saveSessionMemory 原始回应]:\n' + resp.slice(0, 300) + (resp.length > 300 ? '...' : ''))
 
-  const profileMatch = resp.match(/【PROFILE_REWRITE】\n?([\s\S]+?)(?=【SOUL_REWRITE】)/)
-  const soulMatch = resp.match(/【SOUL_REWRITE】\n?([\s\S]+)$/)
+  // 宽松匹配：允许标记前后有任意空白
+  const profileMatch = resp.match(/【PROFILE_REWRITE】\s*([\s\S]+?)(?=\s*【SOUL_REWRITE】)/)
+  const soulMatch = resp.match(/【SOUL_REWRITE】\s*([\s\S]+)$/)
 
   if (profileMatch?.[1]?.trim()) {
     fs.writeFileSync(path.join(AGENT_DIR, 'profile.md'), profileMatch[1].trim() + '\n')
     console.log('  ✓ profile.md 已合并重写')
+  } else {
+    console.log('  ⚠️ profile.md 未匹配到【PROFILE_REWRITE】')
   }
   if (soulMatch?.[1]?.trim()) {
     fs.writeFileSync(path.join(AGENT_DIR, 'soul.md'), soulMatch[1].trim() + '\n')
     console.log('  ✓ soul.md 已合并重写')
+  } else {
+    console.log('  ⚠️ soul.md 未匹配到【SOUL_REWRITE】')
   }
 }
 
@@ -316,7 +324,7 @@ async function processNewAnnotations() {
     annTurnCount = 0
     console.log(`\n── 新划线 · 《${ann.bookTitle}》${ann.chapter || ''} ──`)
     const reply = await say(buildAnnotationPrompt(ann))
-    console.log('\n' + reply + '\n')
+    console.log('\n' + stripCodeBlocks(reply) + '\n')
     appendChatOutput('assistant', reply)
   }
   setCursor(anns.length)
@@ -374,7 +382,7 @@ async function main() {
         const reply = await say(userMsg)
         const takeaway = extractTakeaway(reply)
         if (takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
-        console.log('\n[侧栏] ' + reply + '\n')
+        console.log('\n[侧栏] ' + stripCodeBlocks(reply) + '\n')
         appendChatOutput('assistant', reply)
       }
       setChatInputCursor(inputs.length)
@@ -402,7 +410,7 @@ async function main() {
         await processNewAnnotations()
       } else if (line.startsWith('【章节完成】')) {
         const reply = await say(line)
-        console.log('\n' + reply + '\n')
+        console.log('\n' + stripCodeBlocks(reply) + '\n')
         appendChatOutput('assistant', reply)
       } else {
         // 普通用户回复：追踪轮次，第 3 轮起附 takeaway 请求
@@ -419,7 +427,7 @@ async function main() {
           console.log(`\n  [takeaway 已保存]\n`)
         }
 
-        console.log('\n' + reply + '\n')
+        console.log('\n' + stripCodeBlocks(reply) + '\n')
         appendChatOutput('assistant', reply)
       }
     } catch (e) {
@@ -430,12 +438,15 @@ async function main() {
     rl.prompt()
   })
 
-  rl.on('close', async () => {
+  async function shutdown() {
     clearInterval(poller)
     try { await saveSessionMemory() } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
     console.log('👋 共读会话结束。')
     process.exit(0)
-  })
+  }
+
+  rl.on('close', shutdown)
+  process.on('SIGINT', shutdown)
 }
 
 main().catch(e => { console.error('❌', e.message); process.exit(1) })
