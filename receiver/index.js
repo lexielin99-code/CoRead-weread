@@ -16,6 +16,7 @@ const PORT = parseInt(process.env.COREAD_PORT || '7239')
 const BOOKS_DIR = path.join(__dirname, 'books')
 const INBOX_DIR = path.join(__dirname, 'inbox')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
+const DEBUG_LOG = path.join(INBOX_DIR, 'debug.jsonl')
 
 fs.mkdirSync(BOOKS_DIR, { recursive: true })
 fs.mkdirSync(INBOX_DIR, { recursive: true })
@@ -62,6 +63,10 @@ function bookDir(bookId) {
   return d
 }
 
+function baseBookId(bookId) {
+  return String(bookId || '').replace(/k[0-9a-f]{24,}$/i, '')
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = ''
@@ -74,6 +79,21 @@ function readBody(req) {
   })
 }
 
+function readIfExists(p) {
+  try { return fs.readFileSync(p, 'utf8') } catch { return '' }
+}
+
+function normalizeText(text) {
+  return String(text || '').replace(/\s+/g, '')
+}
+
+function looksWereadEncoded(text) {
+  return /^[0-9A-Fa-f]{32}[A-Za-z0-9+/=]{100,}$/.test(String(text || '').trim())
+}
+
+function cjkCount(text) {
+  return (String(text || '').match(/[\u4e00-\u9fff]/g) || []).length
+}
 
 function triggerInject(message) {
   const pendingFile = path.join(INBOX_DIR, 'pending.txt')
@@ -178,14 +198,37 @@ const server = http.createServer(async (req, res) => {
 
     } else if (url === '/content') {
       // 章节正文缓存
-      const { bookId, chapterUid, text } = data
+      const { bookId, chapterUid, text, selectedText } = data
       if (!bookId || !chapterUid || !text) {
         console.warn(`[content] 400 missing fields: bookId=${bookId} chapterUid=${chapterUid} textLen=${text?.length}`)
         res.writeHead(400); res.end(); return
       }
       const chapterFile = path.join(bookDir(bookId), 'chapters', `${chapterUid}.txt`)
+      const existing = readIfExists(chapterFile)
+      if (existing && existing.length > text.length) {
+        if (looksWereadEncoded(existing) && cjkCount(text) > 50) {
+          fs.writeFileSync(chapterFile, text)
+          console.log(`[content] replaced encoded bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars)`)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, replacedEncoded: true }))
+          return
+        }
+        const existingHasSelection = selectedText && normalizeText(existing).includes(normalizeText(selectedText))
+        const textHasSelection = selectedText && normalizeText(text).includes(normalizeText(selectedText))
+        if (selectedText && (existingHasSelection || !textHasSelection)) {
+          console.log(`[content] kept existing bookId=${bookId} chapterUid=${chapterUid} (${existing.length} chars)`)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, keptExisting: true }))
+          return
+        }
+      }
       fs.writeFileSync(chapterFile, text)
       console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars)`)
+
+    } else if (url === '/debug') {
+      const line = JSON.stringify({ ...data, receivedAt: Date.now() })
+      fs.appendFileSync(DEBUG_LOG, line + '\n')
+      console.log(`[debug] ${data.source || 'unknown'} ${data.stage || ''} ${data.bookTitle || data.bookId || ''}`)
 
     } else if (url === '/chapter-complete') {
       // 章节结束事件
@@ -202,8 +245,12 @@ const server = http.createServer(async (req, res) => {
       // 进度同步（来自 weread API 兜底轮询，后期用）
       const { bookId } = data
       if (bookId) {
-        const progressFile = path.join(bookDir(bookId), 'progress.json')
-        fs.writeFileSync(progressFile, JSON.stringify({ ...data, updatedAt: Date.now() }))
+        const payload = JSON.stringify({ ...data, updatedAt: Date.now() })
+        fs.writeFileSync(path.join(bookDir(bookId), 'progress.json'), payload)
+        const baseId = baseBookId(bookId)
+        if (baseId && baseId !== bookId) {
+          fs.writeFileSync(path.join(bookDir(baseId), 'progress.json'), payload)
+        }
       }
 
     } else {

@@ -95,16 +95,141 @@ function getCursor() {
 function setCursor(n) { fs.writeFileSync(CURSOR_FILE, String(n)) }
 
 // ── 章节原文上下文 ───────────────────────────────────────────────────────────
-function chapterWindow(bookId, chapterUid, selectedText) {
-  if (!bookId || !chapterUid) return ''
-  const file = path.join(BOOKS_DIR, bookId, 'chapters', `${chapterUid}.txt`)
-  const text = readIfExists(file)
+function chapterFileName(chapter) {
+  return chapter ? chapter.replace(/[^\w一-龥]/g, '_').slice(0, 40) : ''
+}
+
+function readJsonIfExists(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch { return null }
+}
+
+function baseBookId(bookId) {
+  return String(bookId || '').replace(/k[0-9a-f]{24,}$/i, '')
+}
+
+function readChapterText(bookId, chapterUid, chapter, selectedText) {
+  if (!bookId) return ''
+  const dir = path.join(BOOKS_DIR, bookId, 'chapters')
+  const candidates = [
+    chapterUid && path.join(dir, `${chapterUid}.txt`),
+    chapter && path.join(dir, `${chapterFileName(chapter)}.txt`),
+  ].filter(Boolean)
+
+  for (const file of candidates) {
+    const text = readIfExists(file)
+    if (!text) continue
+    if (!selectedText || normalizeText(text).includes(normalizeText(selectedText))) return text
+  }
+
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.txt')) continue
+      const text = readIfExists(path.join(dir, name))
+      if (selectedText && normalizeText(text).includes(normalizeText(selectedText))) return text
+    }
+  } catch {}
+
+  return ''
+}
+
+function chapterTexts(bookId, chapter) {
+  if (!bookId || !chapter) return []
+  const dir = path.join(BOOKS_DIR, bookId, 'chapters')
+  const prefix = chapterFileName(chapter)
+  try {
+    return fs.readdirSync(dir)
+      .filter(name => name.endsWith('.txt') && (name === `${prefix}.txt` || name.startsWith(`${prefix}_`)))
+      .sort()
+      .map(name => readIfExists(path.join(dir, name)))
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function readProgress(bookId) {
+  if (!bookId) return null
+  const direct = readJsonIfExists(path.join(BOOKS_DIR, bookId, 'progress.json'))
+  if (direct) return direct
+
+  const baseId = baseBookId(bookId)
+  if (baseId && baseId !== bookId) {
+    const baseProgress = readJsonIfExists(path.join(BOOKS_DIR, baseId, 'progress.json'))
+    if (baseProgress) return baseProgress
+  }
+
+  try {
+    const matches = fs.readdirSync(BOOKS_DIR)
+      .filter(name => name === baseId || name.startsWith(`${baseId}k`))
+      .map(name => readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json')))
+      .filter(Boolean)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    return matches[0] || null
+  } catch {
+    return null
+  }
+}
+
+function normalizeText(text) {
+  return String(text || '').replace(/\s+/g, '')
+}
+
+function looseIndexOf(text, needle) {
+  if (!needle) return -1
+  const exact = text.indexOf(needle)
+  if (exact !== -1) return exact
+
+  const compactNeedle = normalizeText(needle)
+  if (!compactNeedle) return -1
+
+  let compact = ''
+  const positions = []
+  for (let i = 0; i < text.length; i++) {
+    if (/\s/.test(text[i])) continue
+    positions.push(i)
+    compact += text[i]
+  }
+  const compactIdx = compact.indexOf(compactNeedle)
+  return compactIdx === -1 ? -1 : positions[compactIdx]
+}
+
+function chapterWindow(bookId, chapterUid, selectedText, chapter) {
+  const text = readChapterText(bookId, chapterUid, chapter, selectedText)
   if (!text) return ''
-  const idx = text.indexOf(selectedText)
+  const idx = looseIndexOf(text, selectedText)
   if (idx === -1) return text.slice(0, 600)
   const start = Math.max(0, idx - 300)
   const end = Math.min(text.length, idx + selectedText.length + 300)
   return text.slice(start, end)
+}
+
+function readProgressContext(bookId, chapter, selectedText) {
+  const progress = readProgress(bookId)
+  const chunks = chapterTexts(bookId, chapter)
+  const joined = chunks.join('\n\n')
+  if (!progress && !joined) return ''
+
+  let p = ''
+  if (progress) {
+    const bits = []
+    if (progress.chapterTitle || chapter) bits.push(`当前章节：${progress.chapterTitle || chapter}`)
+    if (progress.chapterUid) bits.push(`chapterUid=${progress.chapterUid}`)
+    if (Number.isFinite(progress.chapterOffset)) bits.push(`offset=${progress.chapterOffset}`)
+    p += `[本章已读进度概览]\n${bits.join('；')}\n`
+    if (progress.summary) p += `微信读书当前位置摘要：${progress.summary}\n`
+  }
+
+  if (!joined) return p.trim()
+
+  const selectedIdx = looseIndexOf(joined, selectedText)
+  const offset = Number.isFinite(progress?.chapterOffset) ? progress.chapterOffset : 0
+  const end = selectedIdx !== -1 ? selectedIdx : (offset > 0 ? Math.min(joined.length, offset) : joined.length)
+  const start = Math.max(0, end - 1500)
+  const windowText = joined.slice(start, end).trim()
+  if (windowText) {
+    p += `\n[当前进度前文窗口]\n${windowText}\n`
+  }
+  return p.trim()
 }
 
 function bookSummaries(bookId) {
@@ -116,26 +241,67 @@ function bookSummaries(bookId) {
 let SYSTEM = buildSystemInstruction()
 const history = []  // [{ role: 'user'|'assistant', content: string }]
 
-async function callLLM() {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function htmlTitle(text) {
+  const match = String(text || '').match(/<h1[^>]*>(.*?)<\/h1>/i)
+  return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
+}
+
+async function callLLMOnce() {
+  const body = JSON.stringify({
+    model: MODEL,
+    messages: [{ role: 'system', content: SYSTEM }, ...history],
+    max_tokens: 1024,
+    tool_choice: 'none',
+    enable_thinking: true,
+  })
   const resp = await fetch(`${API_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       'authorization': `Bearer ${API_KEY}`,
     },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: 'system', content: SYSTEM }, ...history],
-      max_tokens: 1024,
-      tool_choice: 'none',
-    }),
+    body,
   })
-  const data = await resp.json()
+
+  const raw = await resp.text()
+  let data
+  try { data = JSON.parse(raw) } catch { data = null }
+
+  if (!resp.ok) {
+    const brief = data?.error?.message || htmlTitle(raw) || raw.slice(0, 120).replace(/\s+/g, ' ').trim()
+    const err = new Error(`LLM API ${resp.status}: ${brief || '请求失败'}`)
+    err.status = resp.status
+    throw err
+  }
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error))
   const msg = data.choices?.[0]?.message
-  const text = msg?.content || msg?.reasoning_content
+  // reasoning_content = chain-of-thought (不显示给用户)
+  // content = 最终回复 (显示给用户)
+  // 如果 content 是空的说明模型把回复放进了 reasoning_content，反向使用
+  const content = msg?.content?.trim()
+  const reasoning = msg?.reasoning_content?.trim()
+  const looksLikeThinking = content && /^(\*\*理解|1\.\s*\*\*|##\s*分析)/.test(content)
+  const text = looksLikeThinking ? reasoning : (content || reasoning)
   if (!text) throw new Error('模型无回应：' + JSON.stringify(data).slice(0, 200))
-  return text.trim()
+  return text
+}
+
+async function callLLM() {
+  let lastErr
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await callLLMOnce()
+    } catch (e) {
+      lastErr = e
+      if (![429, 500, 502, 503, 504].includes(e.status) || attempt === 3) break
+      await sleep(800 * attempt)
+    }
+  }
+  throw lastErr
 }
 
 function stripCodeBlocks(text) {
@@ -208,17 +374,27 @@ ${currentSoul}`
   const profileMatch = resp.match(/【PROFILE_REWRITE】\s*([\s\S]+?)(?=\s*【SOUL_REWRITE】)/)
   const soulMatch = resp.match(/【SOUL_REWRITE】\s*([\s\S]+)$/)
 
-  if (profileMatch?.[1]?.trim()) {
-    fs.writeFileSync(path.join(AGENT_DIR, 'profile.md'), profileMatch[1].trim() + '\n')
+  function looksValid(content) {
+    // 必须有 ## 标题且超过 80 字，避免写入模型的推理碎片
+    return content && content.includes('##') && content.replace(/\s/g, '').length > 80
+  }
+
+  const profileContent = profileMatch?.[1]?.trim()
+  if (looksValid(profileContent)) {
+    fs.writeFileSync(path.join(AGENT_DIR, 'profile.md'), profileContent + '\n')
     console.log('  ✓ profile.md 已合并重写')
   } else {
-    console.log('  ⚠️ profile.md 未匹配到【PROFILE_REWRITE】')
+    console.log('  ⚠️ profile.md 校验未通过，跳过写入（原文件保留）')
+    if (profileContent) console.log('    内容预览：' + profileContent.slice(0, 80))
   }
-  if (soulMatch?.[1]?.trim()) {
-    fs.writeFileSync(path.join(AGENT_DIR, 'soul.md'), soulMatch[1].trim() + '\n')
+
+  const soulContent = soulMatch?.[1]?.trim()
+  if (looksValid(soulContent)) {
+    fs.writeFileSync(path.join(AGENT_DIR, 'soul.md'), soulContent + '\n')
     console.log('  ✓ soul.md 已合并重写')
   } else {
-    console.log('  ⚠️ soul.md 未匹配到【SOUL_REWRITE】')
+    console.log('  ⚠️ soul.md 校验未通过，跳过写入（原文件保留）')
+    if (soulContent) console.log('    内容预览：' + soulContent.slice(0, 80))
   }
 }
 
@@ -245,7 +421,10 @@ function buildAnnotationPrompt(ann, turnHint = '') {
   const recall = runRecall(selectedText)
   if (recall) p += `\n[阅读记忆检索]\n${recall}\n`
 
-  const win = chapterWindow(bookId, chapterUid, selectedText)
+  const progressCtx = readProgressContext(bookId, chapter, selectedText)
+  if (progressCtx) p += `\n${progressCtx}\n`
+
+  const win = chapterWindow(bookId, chapterUid, selectedText, chapter)
   if (win) {
     p += `\n[这段话所在的原文上下文]\n${win}\n`
   } else {

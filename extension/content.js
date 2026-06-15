@@ -3,6 +3,7 @@
  */
 
 const RECEIVER = 'http://localhost:7239'
+const DEBUG_VERSION = 'selection-context-v1'
 
 // ── 1. 允许文字选中 ──────────────────────────────────────────────────────────
 const styleEl = document.createElement('style')
@@ -11,9 +12,23 @@ document.head.appendChild(styleEl)
 
 // ── 2. 接收 page_hook.js（MAIN world）拦截到的消息 ──────────────────────────
 let _copiedText = ''
+let _copySelection = null
 window.addEventListener('message', e => {
-  if (e.data?.__cr === 'copy') _copiedText = e.data.text
+  if (e.data?.__cr === 'copy') {
+    _copiedText = e.data.text
+    _copySelection = e.data.selection || null
+  }
   if (e.data?.__cr === 'chapter') handleChapterContent(e.data.url, e.data.raw)
+  if (e.data?.__cr === 'progress') handleProgressContent(e.data.url, e.data.raw)
+  if (e.data?.__cr === 'network-meta') {
+    postDebug({
+      source: 'network-discover',
+      stage: e.data.source || '',
+      url: e.data.url || '',
+      rawLength: e.data.rawLength || 0,
+      preview: e.data.preview || '',
+    })
+  }
 })
 
 // ── 3. 从 DOM / URL 读取当前阅读上下文 ────────────────────────────────────
@@ -31,6 +46,115 @@ function getReadingContext() {
     ''
   const chapterUid = (() => { try { return window.top.location.hash.replace('#', '') } catch { return '' } })()
   return { bookId, bookTitle, chapter, chapterUid }
+}
+
+function previewText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+}
+
+function normalizeText(text) {
+  return String(text || '').replace(/\s+/g, '')
+}
+
+function getQueryParam(queryText, name) {
+  for (const part of String(queryText || '').split('&')) {
+    const [key, value = ''] = part.split('=')
+    if (key === name) {
+      try { return decodeURIComponent(value.replace(/\+/g, ' ')) }
+      catch { return value }
+    }
+  }
+  return ''
+}
+
+function utf8FromBase64(value) {
+  try {
+    const binary = atob(value)
+    const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0))
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+  } catch {
+    return ''
+  }
+}
+
+function textScore(text) {
+  const s = String(text || '')
+  const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length
+  const bad = (s.match(/\uFFFD/g) || []).length
+  return cjk * 4 - bad * 20 + Math.min(s.length, 2000) / 200
+}
+
+function decodeWereadChapter(raw) {
+  const source = String(raw || '').trim()
+  if (!/^[0-9A-Fa-f]{32}[A-Za-z0-9+/=]/.test(source)) return ''
+
+  const bodyWithMarker = source.slice(32)
+  const body = source.slice(33)
+  const candidates = [
+    body,
+    bodyWithMarker,
+    '5' + bodyWithMarker,
+    '6' + bodyWithMarker,
+    '7' + bodyWithMarker,
+    'P' + body,
+  ]
+
+  let best = ''
+  let bestScore = 0
+  for (const candidate of candidates) {
+    const decoded = utf8FromBase64(candidate)
+    const score = textScore(decoded)
+    if (score > bestScore) {
+      best = decoded
+      bestScore = score
+    }
+  }
+  return bestScore > 80 ? best : ''
+}
+
+async function postDebug(data) {
+  try {
+    await fetch(`${RECEIVER}/debug`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ debugVersion: DEBUG_VERSION, ...getReadingContext(), ...data, timestamp: Date.now() }),
+    })
+  } catch {}
+}
+
+async function handleProgressContent(url, raw) {
+  let data
+  try { data = JSON.parse(raw) } catch { return }
+  const ctx = getReadingContext()
+  const book = data.book || {}
+  const payload = {
+    bookId: ctx.bookId,
+    bookTitle: ctx.bookTitle,
+    chapterTitle: ctx.chapter,
+    wereadBookId: data.bookId || book.bookId || '',
+    chapterUid: book.chapterUid || '',
+    chapterIdx: book.chapterIdx || '',
+    chapterOffset: Number.isFinite(book.chapterOffset) ? book.chapterOffset : 0,
+    summary: book.summary || '',
+    synckey: book.synckey || '',
+    sourceUrl: url,
+  }
+  try {
+    await fetch(`${RECEIVER}/progress`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    await postDebug({
+      source: 'progress',
+      stage: 'saved',
+      chapterUid: payload.chapterUid,
+      chapterOffset: payload.chapterOffset,
+      summaryPreview: previewText(payload.summary),
+    })
+  } catch (e) {
+    console.warn('[CoRead] progress POST failed:', e.message)
+  }
 }
 
 // ── 4. 标注弹窗 ────────────────────────────────────────────────────────────
@@ -89,8 +213,22 @@ function showAnnotationPopup(selectedText, x, y) {
   popup.addEventListener('mousedown', e => e.stopPropagation())
 }
 
+function getDirectSelectionText() {
+  const docs = [document]
+  try {
+    if (window.top?.document && window.top.document !== document) docs.push(window.top.document)
+  } catch {}
+  for (const doc of docs) {
+    const text = doc.getSelection?.()?.toString?.()?.trim()
+    if (text) return text
+  }
+  return ''
+}
+
 async function sendAnnotation(selectedText, userNote) {
   const ctx = getReadingContext()
+  await trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
+  await trySendDomContent(ctx.chapterUid, ctx, selectedText)
   const payload = { ...ctx, selectedText, userNote, timestamp: Math.floor(Date.now() / 1000) }
   try {
     await fetch(`${RECEIVER}/annotation`, {
@@ -118,19 +256,29 @@ function injectToolbarButton() {
   `
 
   btn.addEventListener('click', async () => {
-    const toolbar = document.querySelector('.reader_toolbar_container')
-    const rect = toolbar?.getBoundingClientRect() || { left: 200, bottom: 300, width: 300 }
+    try {
+      const toolbar = document.querySelector('.reader_toolbar_container')
+      const rect = toolbar?.getBoundingClientRect() || { left: 200, bottom: 300, width: 300 }
 
-    // 触发 wr_copy 按钮，拦截其 clipboard 调用来取得选中文字
-    _copiedText = ''
-    document.querySelector('.toolbarItem.wr_copy')?.click()
-    await new Promise(r => setTimeout(r, 250))
+      // 触发 wr_copy 按钮，拦截其 clipboard 调用来取得选中文字
+      _copiedText = getDirectSelectionText()
+      _copySelection = null
+      try { document.querySelector('.toolbarItem.wr_copy')?.click() }
+      catch (e) {
+        await postDebug({ source: 'toolbar', stage: 'wr-copy-click-error', message: e.message })
+      }
+      await new Promise(r => setTimeout(r, 250))
 
-    if (!_copiedText) {
-      console.warn('[CoRead] 未能获取选中文字，请确认 clipboard hook 已注入')
-      return
+      if (!_copiedText) {
+        console.warn('[CoRead] 未能获取选中文字，请确认 clipboard hook 已注入')
+        await postDebug({ source: 'toolbar', stage: 'copy-empty' })
+        return
+      }
+      showAnnotationPopup(_copiedText, rect.left + rect.width / 2, rect.bottom)
+    } catch (e) {
+      console.warn('[CoRead] toolbar click failed:', e)
+      await postDebug({ source: 'toolbar', stage: 'click-error', message: e.message, stack: String(e.stack || '').slice(0, 600) })
     }
-    showAnnotationPopup(_copiedText, rect.left + rect.width / 2, rect.bottom)
   })
 
   container.appendChild(btn)
@@ -141,9 +289,15 @@ function injectToolbarButton() {
 
 // 来自 page_hook.js 拦截到的网络响应（主路线）
 async function handleChapterContent(url, raw) {
-  const urlObj = new URL(url)
-  const bookId = urlObj.searchParams.get('bookId') || ''
-  const chapterUid = urlObj.searchParams.get('chapterUid') || url.split('/').pop().split('?')[0]
+  const urlText = String(url || '')
+  const queryText = urlText.split('?')[1] || ''
+  const pathText = urlText.split('?')[0] || ''
+  const ctx = getReadingContext()
+  const bookId = getQueryParam(queryText, 'bookId') || ctx.bookId || ''
+  const slotUid = getQueryParam(queryText, 'chapterUid') || pathText.split('/').filter(Boolean).pop()
+  const chapterUid = /^t_\d+$/.test(slotUid) && ctx.chapter
+    ? `${chapterFileName(ctx, '')}_${slotUid}`
+    : slotUid
   if (!bookId || !chapterUid) return
 
   let text = ''
@@ -151,10 +305,18 @@ async function handleChapterContent(url, raw) {
     const json = JSON.parse(raw)
     text = json.content || json.chapterContent || json.data?.content || ''
     if (Array.isArray(text)) text = text.join('\n\n')
-    if (!text && raw.length > 200) text = raw
   } catch {
-    if (raw.length > 200) text = raw
+    text = decodeWereadChapter(raw)
+    if (!text && raw.length > 200 && !/^[0-9A-Fa-f]{32}[A-Za-z0-9+/=]/.test(String(raw || '').trim())) text = raw
   }
+  await postDebug({
+    source: 'network',
+    stage: 'chapter-response',
+    url,
+    rawLength: raw.length,
+    extractedTextLength: String(text || '').length,
+    extractedPreview: previewText(text),
+  })
   if (!text || text.length < 100) return
 
   text = text.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim()
@@ -172,29 +334,87 @@ async function handleChapterContent(url, raw) {
 
 // DOM 捕获 ─────────────────────────────────────────────────────────────────
 function captureCurrentChapterText() {
-  const paras = document.querySelectorAll(
-    '.wr_readerPage p, .reader_chapter p, [class*="readerPage"] p, [class*="reader"] p'
-  )
-  if (!paras.length) return ''
-  return Array.from(paras)
+  const paras = document.querySelectorAll([
+    '.wr_readerPage p',
+    '.reader_chapter p',
+    '[class*="readerPage"] p',
+    '[class*="reader"] p',
+    '.wr_readerPage [class*="content"]',
+    '.reader_chapter [class*="content"]',
+    '[class*="readerPage"] [class*="content"]',
+  ].join(', '))
+  const text = Array.from(paras)
     .map(p => p.textContent.trim())
+    .filter(t => t.length > 0)
+    .join('\n\n')
+  if (text.length >= 100) return text
+
+  const container = document.querySelector('.wr_readerPage, .reader_chapter, [class*="readerPage"]')
+  return (container?.innerText || '')
+    .split('\n')
+    .map(t => t.trim())
     .filter(t => t.length > 0)
     .join('\n\n')
 }
 
-async function trySendDomContent(chapterUid) {
-  const ctx = getReadingContext()
-  const text = captureCurrentChapterText()
-  if (!text || text.length < 100) return
-  // chapterUid fallback：hash 拿不到时用章节标题 slug
-  const uid = chapterUid || ctx.chapterUid
+function chapterFileName(ctx, chapterUid) {
+  return chapterUid || ctx.chapterUid
     || (ctx.chapter ? ctx.chapter.replace(/[^\w一-龥]/g, '_').slice(0, 40) : '')
     || `t${Date.now()}`
+}
+
+async function trySendSelectionContent(chapterUid, ctx, selectedText, selection) {
+  const text = selection?.context || ''
+  const containsSelection = selectedText ? normalizeText(text).includes(normalizeText(selectedText)) : false
+  await postDebug({
+    ...ctx,
+    source: 'selection',
+    stage: 'annotation-send',
+    textLength: text.length,
+    contextLength: selection?.contextLength || 0,
+    containsSelection,
+    selectedTextLength: selectedText.length,
+    selectedPreview: previewText(selectedText),
+    textPreview: previewText(text),
+    ancestorTag: selection?.ancestorTag || '',
+    ancestorClass: String(selection?.ancestorClass || '').slice(0, 120),
+  })
+  if (!text || text.length < 100 || !containsSelection) return
+  const uid = chapterFileName(ctx, chapterUid)
   try {
     await fetch(`${RECEIVER}/content`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId: ctx.bookId, chapterUid: uid, text, source: 'dom' }),
+      body: JSON.stringify({ bookId: ctx.bookId, chapterUid: uid, text, selectedText, source: 'selection' }),
+    })
+    console.log(`[CoRead] chapter saved via selection: ${text.length} chars uid=${uid}`)
+  } catch (e) {
+    console.warn('[CoRead] selection content POST failed:', e.message)
+  }
+}
+
+async function trySendDomContent(chapterUid, ctxOverride, selectedText = '') {
+  const ctx = ctxOverride || getReadingContext()
+  const text = captureCurrentChapterText()
+  const containsSelection = selectedText ? normalizeText(text).includes(normalizeText(selectedText)) : null
+  await postDebug({
+    ...ctx,
+    source: 'dom',
+    stage: selectedText ? 'annotation-send' : 'chapter-change',
+    textLength: text.length,
+    containsSelection,
+    selectedTextLength: selectedText.length,
+    selectedPreview: previewText(selectedText),
+    textPreview: previewText(text),
+  })
+  if (!text || text.length < 100) return
+  if (selectedText && !containsSelection) return
+  const uid = chapterFileName(ctx, chapterUid)
+  try {
+    await fetch(`${RECEIVER}/content`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: ctx.bookId, chapterUid: uid, text, selectedText, source: 'dom' }),
     })
     console.log(`[CoRead] chapter saved via DOM: ${text.length} chars uid=${uid}`)
   } catch (e) {
@@ -209,7 +429,6 @@ let lastChapterTitle = ''
 function onChapterChange(ctx) {
   if (ctx.chapterUid === lastChapterUid && ctx.chapter === lastChapterTitle) return
   if (lastChapterUid && lastChapterTitle) {
-    trySendDomContent(lastChapterUid)
     reportChapterComplete(lastChapterUid, lastChapterTitle)
   }
   lastChapterUid = ctx.chapterUid
@@ -248,4 +467,5 @@ document.addEventListener('mousedown', e => {
 const initCtx = getReadingContext()
 lastChapterUid = initCtx.chapterUid
 lastChapterTitle = initCtx.chapter
+postDebug({ source: 'lifecycle', stage: 'content-loaded' })
 console.log('[CoRead] content script loaded', initCtx)
