@@ -64,7 +64,7 @@ function bookDir(bookId) {
 }
 
 function baseBookId(bookId) {
-  return String(bookId || '').replace(/k[0-9a-f]{24,}$/i, '')
+  return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
 }
 
 function readBody(req) {
@@ -93,6 +93,44 @@ function looksWereadEncoded(text) {
 
 function cjkCount(text) {
   return (String(text || '').match(/[\u4e00-\u9fff]/g) || []).length
+}
+
+function safeWriteContent(bookId, chapterUid, text, selectedText) {
+  const chapterFile = path.join(bookDir(bookId), 'chapters', `${chapterUid}.txt`)
+  const existing = readIfExists(chapterFile)
+  if (existing && existing.length > text.length) {
+    if (looksWereadEncoded(existing) && cjkCount(text) > 50) {
+      fs.writeFileSync(chapterFile, text)
+      return 'replacedEncoded'
+    }
+    const existingHasSelection = selectedText && normalizeText(existing).includes(normalizeText(selectedText))
+    const textHasSelection = selectedText && normalizeText(text).includes(normalizeText(selectedText))
+    if (selectedText && (existingHasSelection || !textHasSelection)) {
+      return 'keptExisting'
+    }
+    if (!selectedText) {
+      return 'keptExisting'
+    }
+  }
+  fs.writeFileSync(chapterFile, text)
+  return 'written'
+}
+
+function writeBookMeta(bookId, data) {
+  if (!bookId) return
+  const file = path.join(bookDir(bookId), 'meta.json')
+  const prev = (() => {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return {} }
+  })()
+  const next = {
+    ...prev,
+    bookId,
+    baseBookId: data.baseBookId || baseBookId(bookId),
+    bookTitle: data.bookTitle || prev.bookTitle || '',
+    wereadBookId: data.wereadBookId || prev.wereadBookId || '',
+    updatedAt: Date.now(),
+  }
+  fs.writeFileSync(file, JSON.stringify(next))
 }
 
 function triggerInject(message) {
@@ -178,6 +216,9 @@ const server = http.createServer(async (req, res) => {
       // 标注写入 inbox
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
+      writeBookMeta(data.bookId, data)
+      const annotationBaseId = baseBookId(data.bookId)
+      if (annotationBaseId && annotationBaseId !== data.bookId) writeBookMeta(annotationBaseId, data)
       console.log(`[annotation] ${data.bookTitle} · ${data.chapter} · "${data.selectedText?.slice(0, 20)}..."`)
       triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
       // 推送标注事件到侧栏（含用户批注）
@@ -203,27 +244,16 @@ const server = http.createServer(async (req, res) => {
         console.warn(`[content] 400 missing fields: bookId=${bookId} chapterUid=${chapterUid} textLen=${text?.length}`)
         res.writeHead(400); res.end(); return
       }
-      const chapterFile = path.join(bookDir(bookId), 'chapters', `${chapterUid}.txt`)
-      const existing = readIfExists(chapterFile)
-      if (existing && existing.length > text.length) {
-        if (looksWereadEncoded(existing) && cjkCount(text) > 50) {
-          fs.writeFileSync(chapterFile, text)
-          console.log(`[content] replaced encoded bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars)`)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, replacedEncoded: true }))
-          return
-        }
-        const existingHasSelection = selectedText && normalizeText(existing).includes(normalizeText(selectedText))
-        const textHasSelection = selectedText && normalizeText(text).includes(normalizeText(selectedText))
-        if (selectedText && (existingHasSelection || !textHasSelection)) {
-          console.log(`[content] kept existing bookId=${bookId} chapterUid=${chapterUid} (${existing.length} chars)`)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, keptExisting: true }))
-          return
-        }
+      const ids = [bookId]
+      const normalized = data.baseBookId || baseBookId(bookId)
+      if (normalized && normalized !== bookId) ids.push(normalized)
+
+      const results = {}
+      for (const id of [...new Set(ids)]) {
+        results[id] = safeWriteContent(id, chapterUid, text, selectedText)
+        writeBookMeta(id, data)
       }
-      fs.writeFileSync(chapterFile, text)
-      console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars)`)
+      console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars) ${JSON.stringify(results)}`)
 
     } else if (url === '/debug') {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
@@ -247,9 +277,11 @@ const server = http.createServer(async (req, res) => {
       if (bookId) {
         const payload = JSON.stringify({ ...data, updatedAt: Date.now() })
         fs.writeFileSync(path.join(bookDir(bookId), 'progress.json'), payload)
+        writeBookMeta(bookId, data)
         const baseId = baseBookId(bookId)
         if (baseId && baseId !== bookId) {
           fs.writeFileSync(path.join(bookDir(baseId), 'progress.json'), payload)
+          writeBookMeta(baseId, data)
         }
       }
 

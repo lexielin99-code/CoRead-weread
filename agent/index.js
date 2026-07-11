@@ -104,50 +104,91 @@ function readJsonIfExists(p) {
 }
 
 function baseBookId(bookId) {
-  return String(bookId || '').replace(/k[0-9a-f]{24,}$/i, '')
+  return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
 }
 
-function readChapterText(bookId, chapterUid, chapter, selectedText) {
-  if (!bookId) return ''
-  const dir = path.join(BOOKS_DIR, bookId, 'chapters')
-  const candidates = [
-    chapterUid && path.join(dir, `${chapterUid}.txt`),
-    chapter && path.join(dir, `${chapterFileName(chapter)}.txt`),
-  ].filter(Boolean)
-
-  for (const file of candidates) {
-    const text = readIfExists(file)
-    if (!text) continue
-    if (!selectedText || normalizeText(text).includes(normalizeText(selectedText))) return text
-  }
+function bookDirNames(bookId, bookTitle = '') {
+  if (!bookId) return []
+  const baseId = baseBookId(bookId)
+  const names = [bookId]
+  if (baseId && baseId !== bookId) names.push(baseId)
+  const targetTitle = normalizeText(bookTitle)
 
   try {
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.endsWith('.txt')) continue
-      const text = readIfExists(path.join(dir, name))
-      if (selectedText && normalizeText(text).includes(normalizeText(selectedText))) return text
-    }
+    const siblings = fs.readdirSync(BOOKS_DIR)
+      .map(name => {
+        const progress = readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json')) || {}
+        const meta = readJsonIfExists(path.join(BOOKS_DIR, name, 'meta.json')) || {}
+        const sameId = name === baseId || name.startsWith(`${baseId}k`)
+        const sameTitle = targetTitle && normalizeText(meta.bookTitle || progress.bookTitle) === targetTitle
+        return { name, sameId, sameTitle, updatedAt: meta.updatedAt || progress.updatedAt || 0 }
+      })
+      .filter(item => item.sameId || item.sameTitle)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map(item => item.name)
+    names.push(...siblings)
   } catch {}
 
-  return ''
+  return [...new Set(names)]
 }
 
-function chapterTexts(bookId, chapter) {
-  if (!bookId || !chapter) return []
-  const dir = path.join(BOOKS_DIR, bookId, 'chapters')
-  const prefix = chapterFileName(chapter)
-  try {
-    return fs.readdirSync(dir)
-      .filter(name => name.endsWith('.txt') && (name === `${prefix}.txt` || name.startsWith(`${prefix}_`)))
-      .sort()
-      .map(name => readIfExists(path.join(dir, name)))
-      .filter(Boolean)
-  } catch {
-    return []
+function readChapterText(bookId, chapterUid, chapter, selectedText, bookTitle = '') {
+  if (!bookId) return ''
+  const exactMatches = []
+  const fuzzyMatches = []
+  for (const dirName of bookDirNames(bookId, bookTitle)) {
+    const dir = path.join(BOOKS_DIR, dirName, 'chapters')
+    const candidates = [
+      chapterUid && path.join(dir, `${chapterUid}.txt`),
+      chapter && path.join(dir, `${chapterFileName(chapter)}.txt`),
+    ].filter(Boolean)
+
+    for (const file of candidates) {
+      const text = readIfExists(file)
+      if (!text) continue
+      if (hasExactSelection(text, selectedText)) exactMatches.push(text)
+      else if (textHasSelection(text, selectedText)) fuzzyMatches.push(text)
+    }
+
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.endsWith('.txt')) continue
+        const text = readIfExists(path.join(dir, name))
+        if (!selectedText) continue
+        if (hasExactSelection(text, selectedText)) exactMatches.push(text)
+        else if (textHasSelection(text, selectedText)) fuzzyMatches.push(text)
+      }
+    } catch {}
   }
+
+  return exactMatches[0] || fuzzyMatches[0] || ''
 }
 
-function readProgress(bookId) {
+function chapterTexts(bookId, chapter, bookTitle = '') {
+  if (!bookId || !chapter) return []
+  const prefix = chapterFileName(chapter)
+  const compactChapter = normalizeText(chapter)
+  const texts = []
+  for (const dirName of bookDirNames(bookId, bookTitle)) {
+    const dir = path.join(BOOKS_DIR, dirName, 'chapters')
+    let names = []
+    try { names = fs.readdirSync(dir) } catch { continue }
+    const chunkTexts = names
+      .filter(name => name.endsWith('.txt'))
+      .sort()
+      .map(name => {
+        const text = readIfExists(path.join(dir, name))
+        const compactHead = normalizeText(text.slice(0, 200))
+        const namedForChapter = name === `${prefix}.txt` || name.startsWith(`${prefix}_`)
+        return namedForChapter || (compactChapter && compactHead.includes(compactChapter)) ? text : ''
+      })
+      .filter(Boolean)
+    texts.push(...chunkTexts)
+  }
+  return [...new Set(texts)]
+}
+
+function readProgress(bookId, bookTitle = '') {
   if (!bookId) return null
   const direct = readJsonIfExists(path.join(BOOKS_DIR, bookId, 'progress.json'))
   if (direct) return direct
@@ -159,8 +200,7 @@ function readProgress(bookId) {
   }
 
   try {
-    const matches = fs.readdirSync(BOOKS_DIR)
-      .filter(name => name === baseId || name.startsWith(`${baseId}k`))
+    const matches = bookDirNames(bookId, bookTitle)
       .map(name => readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json')))
       .filter(Boolean)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
@@ -172,6 +212,29 @@ function readProgress(bookId) {
 
 function normalizeText(text) {
   return String(text || '').replace(/\s+/g, '')
+}
+
+function selectedNeedles(selectedText) {
+  const source = String(selectedText || '')
+  const pieces = source
+    .split(/[。！？；，,.!?:：;、“”"'\n\r\t（）()]+/)
+    .map(s => normalizeText(s))
+    .filter(s => s.length >= 10)
+  const words = source.match(/[A-Za-z][A-Za-z0-9_-]{3,}/g) || []
+  return [...new Set([normalizeText(source), ...pieces, ...words])]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+}
+
+function textHasSelection(text, selectedText) {
+  if (!selectedText) return true
+  const compact = normalizeText(text)
+  return selectedNeedles(selectedText).some(needle => compact.includes(normalizeText(needle)))
+}
+
+function hasExactSelection(text, selectedText) {
+  if (!selectedText) return true
+  return normalizeText(text).includes(normalizeText(selectedText))
 }
 
 function looseIndexOf(text, needle) {
@@ -193,19 +256,28 @@ function looseIndexOf(text, needle) {
   return compactIdx === -1 ? -1 : positions[compactIdx]
 }
 
-function chapterWindow(bookId, chapterUid, selectedText, chapter) {
-  const text = readChapterText(bookId, chapterUid, chapter, selectedText)
+function selectionMatch(text, selectedText) {
+  for (const needle of selectedNeedles(selectedText)) {
+    const idx = looseIndexOf(text, needle)
+    if (idx !== -1) return { idx, length: needle.length }
+  }
+  return { idx: -1, length: 0 }
+}
+
+function chapterWindow(bookId, chapterUid, selectedText, chapter, bookTitle = '') {
+  const text = readChapterText(bookId, chapterUid, chapter, selectedText, bookTitle)
   if (!text) return ''
-  const idx = looseIndexOf(text, selectedText)
+  const match = selectionMatch(text, selectedText)
+  const idx = match.idx
   if (idx === -1) return text.slice(0, 600)
   const start = Math.max(0, idx - 300)
-  const end = Math.min(text.length, idx + selectedText.length + 300)
+  const end = Math.min(text.length, idx + Math.max(match.length, selectedText.length) + 300)
   return text.slice(start, end)
 }
 
-function readProgressContext(bookId, chapter, selectedText) {
-  const progress = readProgress(bookId)
-  const chunks = chapterTexts(bookId, chapter)
+function readProgressContext(bookId, chapter, selectedText, bookTitle = '') {
+  const progress = readProgress(bookId, bookTitle)
+  const chunks = chapterTexts(bookId, chapter, bookTitle)
   const joined = chunks.join('\n\n')
   if (!progress && !joined) return ''
 
@@ -250,11 +322,11 @@ function htmlTitle(text) {
   return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
 }
 
-async function callLLMOnce() {
+async function callLLMOnce(maxTokens = 1024) {
   const body = JSON.stringify({
     model: MODEL,
     messages: [{ role: 'system', content: SYSTEM }, ...history],
-    max_tokens: 1024,
+    max_tokens: maxTokens,
     tool_choice: 'none',
     enable_thinking: true,
   })
@@ -290,11 +362,11 @@ async function callLLMOnce() {
   return text
 }
 
-async function callLLM() {
+async function callLLM(maxTokens = 1024) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      return await callLLMOnce()
+      return await callLLMOnce(maxTokens)
     } catch (e) {
       lastErr = e
       if (![429, 500, 502, 503, 504].includes(e.status) || attempt === 3) break
@@ -308,11 +380,11 @@ function stripCodeBlocks(text) {
   return text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
 }
 
-async function say(userText) {
+async function say(userText, options = {}) {
   history.push({ role: 'user', content: userText })
   let reply
   try {
-    reply = await callLLM()
+    reply = await callLLM(options.maxTokens || 1024)
   } catch (e) {
     history.pop()
     return `⚠️ ${e.message}`
@@ -367,11 +439,13 @@ ${currentProfile}
 原内容：
 ${currentSoul}`
 
-  const resp = await say(prompt)
+  const resp = await say(prompt, { maxTokens: 1800 })
   console.log('[debug saveSessionMemory 原始回应]:\n' + resp.slice(0, 300) + (resp.length > 300 ? '...' : ''))
 
   // 宽松匹配：允许标记前后有任意空白
-  const profileMatch = resp.match(/【PROFILE_REWRITE】\s*([\s\S]+?)(?=\s*【SOUL_REWRITE】)/)
+  const profileMatch =
+    resp.match(/【PROFILE_REWRITE】\s*([\s\S]+?)(?=\s*【SOUL_REWRITE】)/) ||
+    resp.match(/【PROFILE_REWRITE】\s*([\s\S]+)$/)
   const soulMatch = resp.match(/【SOUL_REWRITE】\s*([\s\S]+)$/)
 
   function looksValid(content) {
@@ -421,10 +495,10 @@ function buildAnnotationPrompt(ann, turnHint = '') {
   const recall = runRecall(selectedText)
   if (recall) p += `\n[阅读记忆检索]\n${recall}\n`
 
-  const progressCtx = readProgressContext(bookId, chapter, selectedText)
+  const progressCtx = readProgressContext(bookId, chapter, selectedText, bookTitle)
   if (progressCtx) p += `\n${progressCtx}\n`
 
-  const win = chapterWindow(bookId, chapterUid, selectedText, chapter)
+  const win = chapterWindow(bookId, chapterUid, selectedText, chapter, bookTitle)
   if (win) {
     p += `\n[这段话所在的原文上下文]\n${win}\n`
   } else {

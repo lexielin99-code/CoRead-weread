@@ -56,6 +56,10 @@ function normalizeText(text) {
   return String(text || '').replace(/\s+/g, '')
 }
 
+function baseBookId(bookId) {
+  return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
+}
+
 function getQueryParam(queryText, name) {
   for (const part of String(queryText || '').split('&')) {
     const [key, value = ''] = part.split('=')
@@ -69,7 +73,9 @@ function getQueryParam(queryText, name) {
 
 function utf8FromBase64(value) {
   try {
-    const binary = atob(value)
+    const clean = String(value || '').replace(/[^A-Za-z0-9+/=]/g, '')
+    const padded = clean + '='.repeat((4 - clean.length % 4) % 4)
+    const binary = atob(padded)
     const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0))
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
   } catch {
@@ -98,18 +104,22 @@ function decodeWereadChapter(raw) {
     '7' + bodyWithMarker,
     'P' + body,
   ]
+  for (let i = 0; i < 6; i++) {
+    candidates.push(source.slice(32 + i))
+    candidates.push(source.slice(33 + i))
+  }
 
   let best = ''
   let bestScore = 0
   for (const candidate of candidates) {
-    const decoded = utf8FromBase64(candidate)
+    const decoded = utf8FromBase64(candidate).replace(/\uFFFD+/g, '')
     const score = textScore(decoded)
     if (score > bestScore) {
       best = decoded
       bestScore = score
     }
   }
-  return bestScore > 80 ? best : ''
+  return bestScore > 40 ? best : ''
 }
 
 async function postDebug(data) {
@@ -295,7 +305,7 @@ async function handleChapterContent(url, raw) {
   const ctx = getReadingContext()
   const bookId = getQueryParam(queryText, 'bookId') || ctx.bookId || ''
   const slotUid = getQueryParam(queryText, 'chapterUid') || pathText.split('/').filter(Boolean).pop()
-  const chapterUid = /^t_\d+$/.test(slotUid) && ctx.chapter
+  const chapterUid = /^[te]_\d+$/.test(slotUid) && ctx.chapter
     ? `${chapterFileName(ctx, '')}_${slotUid}`
     : slotUid
   if (!bookId || !chapterUid) return
@@ -324,7 +334,15 @@ async function handleChapterContent(url, raw) {
     await fetch(`${RECEIVER}/content`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId, chapterUid, text, source: 'network' }),
+      body: JSON.stringify({
+        bookId,
+        baseBookId: baseBookId(bookId),
+        chapterUid,
+        chapterTitle: ctx.chapter,
+        bookTitle: ctx.bookTitle,
+        text,
+        source: 'network',
+      }),
     })
     console.log(`[CoRead] chapter saved via network: bookId=${bookId} uid=${chapterUid} (${text.length} chars)`)
   } catch (e) {
@@ -385,7 +403,16 @@ async function trySendSelectionContent(chapterUid, ctx, selectedText, selection)
     await fetch(`${RECEIVER}/content`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId: ctx.bookId, chapterUid: uid, text, selectedText, source: 'selection' }),
+      body: JSON.stringify({
+        bookId: ctx.bookId,
+        baseBookId: baseBookId(ctx.bookId),
+        bookTitle: ctx.bookTitle,
+        chapterUid: uid,
+        chapterTitle: ctx.chapter,
+        text,
+        selectedText,
+        source: 'selection',
+      }),
     })
     console.log(`[CoRead] chapter saved via selection: ${text.length} chars uid=${uid}`)
   } catch (e) {
@@ -414,7 +441,16 @@ async function trySendDomContent(chapterUid, ctxOverride, selectedText = '') {
     await fetch(`${RECEIVER}/content`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId: ctx.bookId, chapterUid: uid, text, selectedText, source: 'dom' }),
+      body: JSON.stringify({
+        bookId: ctx.bookId,
+        baseBookId: baseBookId(ctx.bookId),
+        bookTitle: ctx.bookTitle,
+        chapterUid: uid,
+        chapterTitle: ctx.chapter,
+        text,
+        selectedText,
+        source: 'dom',
+      }),
     })
     console.log(`[CoRead] chapter saved via DOM: ${text.length} chars uid=${uid}`)
   } catch (e) {
